@@ -15,9 +15,19 @@ std::string getExeDir()
     return (pos != std::string::npos) ? s.substr(0, pos + 1) : ".\\";
 }
 
+// camIdx에 따른 설정 파일 경로 반환
+static std::string getConfigFilePath(int camIdx)
+{
+    std::string confDir = getExeDir() + "conf";
+    if (camIdx == 0)
+        return confDir + "\\setting.cfg";
+    else
+        return confDir + "\\setting_cam" + std::to_string(camIdx) + ".cfg";
+}
+
 // ─────────────────────────────────────────────────────────
 
-bool saveConfig(const AppSettings& settings, const std::vector<cv::Point2f>& corners)
+bool saveConfig(const AppSettings& settings, const std::vector<cv::Point2f>& corners, int camIdx)
 {
     // conf/ 폴더 생성 (이미 있으면 무시)
     std::string confDir = getExeDir() + "conf";
@@ -31,7 +41,7 @@ bool saveConfig(const AppSettings& settings, const std::vector<cv::Point2f>& cor
         }
     }
 
-    std::string filePath = confDir + "\\setting.cfg";
+    std::string filePath = getConfigFilePath(camIdx);
     std::ofstream f(filePath);
     if (!f.is_open())
     {
@@ -39,13 +49,17 @@ bool saveConfig(const AppSettings& settings, const std::vector<cv::Point2f>& cor
         return false;
     }
 
-    f << "ip="            << settings.ipAddress   << "\n";
-    f << "port="          << settings.port         << "\n";
-    f << "target_width="  << settings.targetWidth  << "\n";
-    f << "target_height=" << settings.targetHeight << "\n";
-    f << "exposure="      << settings.exposure     << "\n";
-    f << "corner_count="  << corners.size()        << "\n";
+    // 전역 설정은 카메라 0 파일에만 저장
+    if (camIdx == 0)
+    {
+        f << "ip="            << settings.ipAddress   << "\n";
+        f << "port="          << settings.port         << "\n";
+        f << "target_width="  << settings.targetWidth  << "\n";
+        f << "target_height=" << settings.targetHeight << "\n";
+        f << "exposure="      << settings.exposure     << "\n";
+    }
 
+    f << "corner_count="  << corners.size()        << "\n";
     for (size_t i = 0; i < corners.size(); i++)
     {
         f << "corner" << i << "_x=" << static_cast<int>(corners[i].x) << "\n";
@@ -58,9 +72,9 @@ bool saveConfig(const AppSettings& settings, const std::vector<cv::Point2f>& cor
 
 // ─────────────────────────────────────────────────────────
 
-bool loadConfig(AppSettings& settings, std::vector<cv::Point2f>& corners)
+bool loadConfig(AppSettings& settings, std::vector<cv::Point2f>& corners, int camIdx)
 {
-    std::string filePath = getExeDir() + "conf\\setting.cfg";
+    std::string filePath = getConfigFilePath(camIdx);
     std::ifstream f(filePath);
     if (!f.is_open()) return false;
 
@@ -89,7 +103,6 @@ bool loadConfig(AppSettings& settings, std::vector<cv::Point2f>& corners)
             else if (key == "corner_count")  { cornerCount = std::stoi(val); }
             else if (key.size() > 7 && key.substr(0, 6) == "corner")
             {
-                // 형식: corner{i}_x  또는  corner{i}_y
                 size_t under = key.find('_', 6);
                 if (under != std::string::npos)
                 {
@@ -113,10 +126,7 @@ bool loadConfig(AppSettings& settings, std::vector<cv::Point2f>& corners)
     for (int i = 0; i < n; i++)
         corners.emplace_back(cx[i], cy[i]);
 
-    std::cout << "[Config] Loaded: IP=" << settings.ipAddress
-              << "  Port=" << settings.port
-              << "  " << settings.targetWidth << "x" << settings.targetHeight
-              << "  Exposure=" << settings.exposure
+    std::cout << "[Config] Cam" << camIdx << " loaded: " << filePath
               << "  Corners=" << corners.size() << std::endl;
     return true;
 }

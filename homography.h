@@ -32,3 +32,18 @@ struct MouseCallbackData
 };
 
 void onMouse(int event, int x, int y, int flags, void* userdata);
+
+// ========== 복합 창 마우스 콜백 (2카메라 나란히 배치) ==========
+// 메인 창 레이아웃: [cam0 영역(0..cam0Width-1)] | [cam1 영역(cam0Width..)]
+struct CombinedMouseCallbackData
+{
+    int cam0Width;      // cam0 영역 너비 (클릭 x < cam0Width → cam0 선택)
+    int cam1Width;      // cam1 영역 너비
+    int frameHeight;    // 창 높이
+    int targetWidth;
+    int targetHeight;
+    HomographyState* hom0;
+    HomographyState* hom1;
+};
+
+void onMouseCombined(int event, int x, int y, int flags, void* userdata);

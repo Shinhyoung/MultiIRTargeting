@@ -1,16 +1,11 @@
 /*
- * OptiTrack Flex 13 카메라 IR 영상 추적 프로그램
+ * OptiTrack Flex 13 Dual Camera IR Viewer
  *
- * 기능:
- * - OptiTrack Camera SDK를 사용하여 Flex 13 카메라에서 IR 영상 획득
- * - Grayscale 모드로 원본 IR 이미지 캡처 (IR LED 비활성화)
- * - Morphological dilation을 통한 노이즈 제거 및 객체 강조
- * - 이진화(Threshold)를 통한 밝은 객체 검출
- * - 마우스 클릭으로 관심 영역(ROI) 선택 및 호모그래피 변환
- * - 시작/런타임 설정 다이얼로그 (IP, Port, 해상도, 노출)
+ * - 두 카메라를 하나의 창에 좌우로 나란히 출력
+ * - 각 카메라 영역에서 마우스로 4개 코너 포인트 선택
+ * - 두 카메라 모두 4점 선택 완료 시 호모그래피 변환 후 이어 붙인 워프 창 자동 표시
  */
 
-// Winsock2는 반드시 Windows.h 이전에 포함해야 함
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -30,17 +25,78 @@
 #include <fstream>
 #include <chrono>
 #include <thread>
+#include <string>
 
 using namespace CameraLibrary;
 
+// ─────── OSD helper ──────────────────────────────────────
+static void putShadow(cv::Mat& img, const std::string& t, cv::Scalar color, cv::Point pos)
+{
+    cv::putText(img, t, pos + cv::Point(1, 1),
+                cv::FONT_HERSHEY_SIMPLEX, 0.42, cv::Scalar(0,0,0), 2, cv::LINE_AA);
+    cv::putText(img, t, pos,
+                cv::FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv::LINE_AA);
+}
+
+static void drawMainOSD(cv::Mat& img,
+                        bool udpOn,
+                        int pts0, bool hom0Ready,
+                        int pts1, bool hom1Ready,
+                        bool configSaved,
+                        int cam0W)
+{
+    // Key bindings box
+    {
+        cv::Mat overlay = img.clone();
+        cv::rectangle(overlay, cv::Point(4, 4), cv::Point(270, 136),
+                      cv::Scalar(15, 15, 15), cv::FILLED);
+        cv::addWeighted(overlay, 0.65, img, 0.35, 0, img);
+    }
+
+    cv::Scalar udpColor  = udpOn ? cv::Scalar(60,255,60) : cv::Scalar(120,200,255);
+    std::string udpLabel = std::string("[U] UDP: ") + (udpOn ? "ON  (Sending)" : "OFF");
+
+    putShadow(img, "[Q/ESC] Quit",                     cv::Scalar(200,200,200), cv::Point(10, 22));
+    putShadow(img, udpLabel,                            udpColor,               cv::Point(10, 40));
+    putShadow(img, "[R] Reset all corners",             cv::Scalar(200,200,200), cv::Point(10, 58));
+    putShadow(img, "[P] Settings",                      cv::Scalar(200,200,200), cv::Point(10, 76));
+    putShadow(img, "[S] Save config",                   cv::Scalar(200,200,200), cv::Point(10, 94));
+    putShadow(img, "[L-Click] Select corner (4 pts)",   cv::Scalar(200,200,200), cv::Point(10, 112));
+    putShadow(img, "  left half=Cam0 / right half=Cam1", cv::Scalar(180,180,180), cv::Point(10, 130));
+
+    // Per-camera corner selection progress (bottom of each half)
+    auto c0 = hom0Ready ? cv::Scalar(60,255,60) : cv::Scalar(255,190,60);
+    auto c1 = hom1Ready ? cv::Scalar(60,255,60) : cv::Scalar(255,190,60);
+    std::string s0 = hom0Ready ? "Cam0: READY" : ("Cam0: " + std::to_string(pts0) + "/4 pts");
+    std::string s1 = hom1Ready ? "Cam1: READY" : ("Cam1: " + std::to_string(pts1) + "/4 pts");
+    cv::putText(img, s0, cv::Point(10, img.rows - 10),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, c0, 1, cv::LINE_AA);
+    cv::putText(img, s1, cv::Point(cam0W + 10, img.rows - 10),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, c1, 1, cv::LINE_AA);
+
+    // UDP status (bottom center)
+    std::string udpSt = udpOn ? "udp SENDING" : "udp STOPPED";
+    cv::Scalar  udpSC = udpOn ? cv::Scalar(60,255,60) : cv::Scalar(120,120,120);
+    cv::putText(img, udpSt, cv::Point(img.cols / 2 - 50, img.rows - 10),
+                cv::FONT_HERSHEY_SIMPLEX, 0.5, udpSC, 1, cv::LINE_AA);
+
+    // Config saved flash
+    if (configSaved)
+    {
+        const std::string msg = "Config Saved!";
+        cv::putText(img, msg, cv::Point(img.cols/2 - 79, 36),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0,0,0), 3, cv::LINE_AA);
+        cv::putText(img, msg, cv::Point(img.cols/2 - 80, 35),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(80,255,160), 2, cv::LINE_AA);
+    }
+}
+
+// ─────── Main ────────────────────────────────────────────
 int main(int argc, char* argv[])
 {
-    // ========== 로그 파일 설정 ==========
     std::ofstream logFile("IRViewer_log.txt");
     auto cout_buf = std::cout.rdbuf(logFile.rdbuf());
     auto cerr_buf = std::cerr.rdbuf(logFile.rdbuf());
-
-    // 중복 정리 코드 통합: 오류 종료 시 restoreLog() 호출
     auto restoreLog = [&]()
     {
         std::cout.rdbuf(cout_buf);
@@ -48,155 +104,157 @@ int main(int argc, char* argv[])
         logFile.close();
     };
 
-    std::cout << "=== OptiTrack Flex 13 Camera IR Viewer (Camera SDK) ===" << std::endl;
-    std::cout << "Log started at: "
-              << std::chrono::system_clock::now().time_since_epoch().count() << std::endl;
+    std::cout << "=== OptiTrack Flex 13 Dual Camera IR Viewer ===" << std::endl;
 
-    // ========== 설정 로드 (conf/setting.cfg) 또는 시작 다이얼로그 ==========
+    // ========== 설정 로드 ==========
     AppSettings settings;
-    std::vector<cv::Point2f> configCorners;
-    bool configLoaded = loadConfig(settings, configCorners);
+    std::vector<cv::Point2f> cam0Corners;
+    bool configLoaded = loadConfig(settings, cam0Corners, 0);
     if (!configLoaded)
-        ShowSettingsDialog(settings); // 설정 파일이 없을 때만 다이얼로그 표시
+        ShowSettingsDialog(settings);
 
-    std::cout << "Settings applied: IP=" << settings.ipAddress
+    std::cout << "Settings: IP=" << settings.ipAddress
               << " Port=" << settings.port
               << " TargetW=" << settings.targetWidth
               << " TargetH=" << settings.targetHeight
               << " Exposure=" << settings.exposure << std::endl;
 
     // ========== Camera SDK 초기화 ==========
-    std::cout << "Initializing Camera SDK..." << std::endl;
     CameraManager::X().WaitForInitialization();
-
     if (!CameraManager::X().AreCamerasInitialized())
     {
-        std::cerr << "Failed to initialize cameras." << std::endl;
         restoreLog();
-        MessageBoxA(NULL, "Failed to initialize Camera SDK. Check IRViewer_log.txt for details.",
-                    "Error", MB_OK | MB_ICONERROR);
+        MessageBoxA(NULL, "Failed to initialize Camera SDK.", "Error", MB_OK | MB_ICONERROR);
         return -1;
     }
-    std::cout << "Camera SDK initialized successfully." << std::endl;
 
     CameraList list;
-    std::cout << "Number of cameras detected: " << list.Count() << std::endl;
+    int numDetected = list.Count();
+    std::cout << "Cameras detected: " << numDetected << std::endl;
 
-    if (list.Count() == 0)
+    if (numDetected < 2)
     {
-        std::cerr << "No cameras found!" << std::endl;
         restoreLog();
         CameraManager::X().Shutdown();
-        MessageBoxA(NULL, "No OptiTrack cameras found. Check IRViewer_log.txt for details.",
-                    "Error", MB_OK | MB_ICONERROR);
+        MessageBoxA(NULL,
+            "At least 2 OptiTrack cameras are required.\nCheck connections and try again.",
+            "Error", MB_OK | MB_ICONERROR);
         return -1;
     }
 
-    for (int i = 0; i < list.Count(); i++)
-    {
-        std::cout << "Camera " << i << ": " << list[i].Name() << std::endl;
-        std::cout << "  UID: " << list[i].UID() << std::endl;
-        std::cout << "  Initial State: " << list[i].State() << std::endl;
-    }
+    for (int i = 0; i < numDetected; i++)
+        std::cout << "  Camera " << i << ": " << list[i].Name()
+                  << "  UID=" << list[i].UID()
+                  << "  State=" << list[i].State() << std::endl;
 
-    std::cout << "Waiting for camera to fully initialize..." << std::endl;
-    bool cameraReady = false;
-    for (int i = 0; i < 100; i++) // 최대 10초 대기
+    // ========== 모든 카메라 State==6 대기 ==========
+    std::cout << "Waiting for cameras to initialize..." << std::endl;
+    bool allReady = false;
+    for (int attempt = 0; attempt < 150; attempt++)
     {
         CameraList cur;
-        if (cur.Count() > 0 && cur[0].State() == 6)
+        if (cur.Count() >= 2)
         {
-            cameraReady = true;
-            std::cout << "Camera initialized! (State: " << cur[0].State() << ")" << std::endl;
-            break;
+            allReady = true;
+            for (int i = 0; i < cur.Count(); i++)
+                if (cur[i].State() != 6) { allReady = false; break; }
+            if (allReady) { std::cout << "All cameras ready." << std::endl; break; }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-
-    if (!cameraReady)
+    if (!allReady)
     {
-        std::cerr << "Camera failed to initialize within 10 seconds." << std::endl;
         restoreLog();
         CameraManager::X().Shutdown();
-        MessageBoxA(NULL, "Camera initialization timeout. Check IRViewer_log.txt for details.",
-                    "Error", MB_OK | MB_ICONERROR);
+        MessageBoxA(NULL, "Camera initialization timeout.", "Error", MB_OK | MB_ICONERROR);
         return -1;
     }
 
-    std::cout << "Getting camera with UID: " << list[0].UID() << std::endl;
-    std::shared_ptr<Camera> camera = CameraManager::X().GetCamera(list[0].UID());
-
-    if (!camera)
+    // ========== 카메라 획득 (첫 두 대만 사용) ==========
+    auto cam0 = CameraManager::X().GetCamera(list[0].UID());
+    auto cam1 = CameraManager::X().GetCamera(list[1].UID());
+    if (!cam0 || !cam1)
     {
-        std::cerr << "Failed to get camera pointer." << std::endl;
         restoreLog();
         CameraManager::X().Shutdown();
-        MessageBoxA(NULL, "Failed to get camera pointer. Check IRViewer_log.txt for details.",
-                    "Error", MB_OK | MB_ICONERROR);
+        MessageBoxA(NULL, "Failed to acquire cameras.", "Error", MB_OK | MB_ICONERROR);
         return -1;
     }
 
-    std::cout << "Camera Serial: " << camera->Serial() << std::endl;
-    std::cout << "Camera Name: "   << camera->Name()   << std::endl;
-    std::cout << "Camera Resolution: " << camera->Width() << "x" << camera->Height() << std::endl;
-
-    // ========== 카메라 설정 ==========
-    camera->SetVideoType(Core::GrayscaleMode);
-    std::cout << "Camera set to Grayscale mode." << std::endl;
-
-    camera->SetExposure(settings.exposure);
-    std::cout << "Exposure set to " << settings.exposure << "." << std::endl;
-
-    camera->SetIntensity(0);
-    std::cout << "IR illumination disabled (intensity set to 0)." << std::endl;
-
-    camera->Start();
-    std::cout << "Camera started." << std::endl;
-
-    // ========== OpenCV 윈도우 & 마우스 콜백 ==========
-    int frameWidth  = camera->Width();
-    int frameHeight = camera->Height();
-
-    std::string windowName = "OptiTrack Flex 13 - IR View";
-    cv::namedWindow(windowName, cv::WINDOW_AUTOSIZE | cv::WINDOW_GUI_NORMAL);
-
-    HomographyState hom;
-
-    // conf/setting.cfg 에 저장된 4개 코너가 있으면 호모그래피 즉시 복원
-    if (configLoaded &&
-        static_cast<int>(configCorners.size()) == HomographyState::REQUIRED_POINTS)
+    for (auto& cam : { cam0, cam1 })
     {
-        hom.selectedPoints = configCorners;
-        float tw = static_cast<float>(settings.targetWidth  - 1);
-        float th = static_cast<float>(settings.targetHeight - 1);
+        cam->SetVideoType(Core::GrayscaleMode);
+        cam->SetExposure(settings.exposure);
+        cam->SetIntensity(0);
+        cam->Start();
+    }
+
+    int cam0W = cam0->Width(),  cam0H = cam0->Height();
+    int cam1W = cam1->Width(),  cam1H = cam1->Height();
+    int mainH = std::max(cam0H, cam1H);
+
+    std::cout << "Cam0: " << cam0->Name() << " (" << cam0W << "x" << cam0H << ")" << std::endl;
+    std::cout << "Cam1: " << cam1->Name() << " (" << cam1W << "x" << cam1H << ")" << std::endl;
+
+    // ========== 호모그래피 상태 ==========
+    HomographyState hom0, hom1;
+
+    // Cam0 코너 복원
+    if (configLoaded && (int)cam0Corners.size() == HomographyState::REQUIRED_POINTS)
+    {
+        hom0.selectedPoints = cam0Corners;
+        float tw = (float)(settings.targetWidth  - 1);
+        float th = (float)(settings.targetHeight - 1);
         std::vector<cv::Point2f> dst = { {0.f,0.f},{tw,0.f},{tw,th},{0.f,th} };
-        hom.matrix = cv::getPerspectiveTransform(hom.selectedPoints, dst);
-        hom.ready  = true;
-        std::cout << "[Config] Homography restored from saved corners." << std::endl;
+        hom0.matrix = cv::getPerspectiveTransform(hom0.selectedPoints, dst);
+        hom0.ready  = true;
+        std::cout << "[Config] Cam0 homography restored." << std::endl;
     }
 
-    static MouseCallbackData mouseData;
-    mouseData.windowName   = windowName;
-    mouseData.frameWidth   = frameWidth;
-    mouseData.frameHeight  = frameHeight;
+    // Cam1 코너 복원
+    {
+        std::vector<cv::Point2f> cam1Corners;
+        AppSettings dummy = settings;
+        if (loadConfig(dummy, cam1Corners, 1) &&
+            (int)cam1Corners.size() == HomographyState::REQUIRED_POINTS)
+        {
+            hom1.selectedPoints = cam1Corners;
+            float tw = (float)(settings.targetWidth  - 1);
+            float th = (float)(settings.targetHeight - 1);
+            std::vector<cv::Point2f> dst = { {0.f,0.f},{tw,0.f},{tw,th},{0.f,th} };
+            hom1.matrix = cv::getPerspectiveTransform(hom1.selectedPoints, dst);
+            hom1.ready  = true;
+            std::cout << "[Config] Cam1 homography restored." << std::endl;
+        }
+    }
+
+    // ========== 윈도우 설정 ==========
+    const std::string mainWin     = "IR View";
+    const std::string stitchedWin = "Warped Stitched View";
+    cv::namedWindow(mainWin, cv::WINDOW_AUTOSIZE | cv::WINDOW_GUI_NORMAL);
+
+    // 복합 마우스 콜백
+    CombinedMouseCallbackData mouseData;
+    mouseData.cam0Width   = cam0W;
+    mouseData.cam1Width   = cam1W;
+    mouseData.frameHeight = mainH;
     mouseData.targetWidth  = settings.targetWidth;
     mouseData.targetHeight = settings.targetHeight;
-    mouseData.state        = &hom;
-    cv::setMouseCallback(windowName, onMouse, &mouseData);
+    mouseData.hom0 = &hom0;
+    mouseData.hom1 = &hom1;
+    cv::setMouseCallback(mainWin, onMouseCombined, &mouseData);
 
     std::cout << "Instructions:" << std::endl;
-    std::cout << "  [Q/ESC] Quit  [S] UDP toggle  [R] Reset  [P] Settings" << std::endl;
-    std::cout << "  Left-click on LEFT image to select 4 corner points." << std::endl;
+    std::cout << "  [Q/ESC] Quit  [U] UDP  [R] Reset  [P] Settings  [S] Save" << std::endl;
+    std::cout << "  Left-click in each camera half to select 4 corner points." << std::endl;
 
     // ========== UDP 초기화 ==========
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
     {
-        std::cerr << "WSAStartup failed. Error: " << WSAGetLastError() << std::endl;
         CameraManager::X().Shutdown();
         return -1;
     }
-
     UDPSender sender;
     if (!sender.init(settings.ipAddress, settings.port))
     {
@@ -204,129 +262,244 @@ int main(int argc, char* argv[])
         CameraManager::X().Shutdown();
         return -1;
     }
-    std::cout << "UDP socket ready. Target: " << settings.ipAddress << ":" << settings.port << std::endl;
-    std::cout << "Press 's' to send current detected coordinates via UDP." << std::endl;
+    std::cout << "UDP ready: " << settings.ipAddress << ":" << settings.port << std::endl;
 
     // ========== 메인 루프 ==========
-    bool running        = true;
-    // 설정 파일에서 4점이 복원됐으면 UDP 스트리밍 자동 시작
-    bool continuousSend = (configLoaded && hom.ready);
-    if (continuousSend)
-        std::cout << "[Config] Auto-started UDP streaming." << std::endl;
-
-    std::vector<cv::Point2f> latestSendCenters; // 마지막으로 검출된 전송 대상 좌표
-
-    // K키 저장 확인 메시지용 타이머
+    bool running         = true;
+    bool continuousSend  = (configLoaded && hom0.ready && hom1.ready);
+    bool stitchedWinOpen = false;
     bool showConfigSaved = false;
     auto configSavedTime = std::chrono::steady_clock::time_point{};
 
+    if (continuousSend)
+        std::cout << "[Config] Auto-started UDP streaming." << std::endl;
+
+    cv::Mat latestGray0, latestGray1;
+    FrameResult r0, r1;
+
     while (running)
     {
-        std::shared_ptr<const Frame> frame = camera->LatestFrame();
-
-        if (frame && frame->IsGrayscale())
+        // ── 카메라 0 프레임 처리 ──
         {
-            const unsigned char* data = frame->GrayscaleData(*camera);
-            if (data)
+            auto frame = cam0->LatestFrame();
+            if (frame && frame->IsGrayscale())
             {
-                FrameResult r = processFrame(data, frameWidth, frameHeight, hom, settings);
-
-                // 전송 대상 좌표 갱신
-                latestSendCenters = hom.ready ? r.inBoundCenters : std::vector<cv::Point2f>{};
-
-                // 좌우 패널 합성
-                cv::Mat combined;
-                cv::hconcat(r.leftPanel, r.rightPanel, combined);
-
-                // OSD 렌더링
-                // 저장 확인 메시지 타이머 체크 (2초 후 소멸)
-                if (showConfigSaved)
+                const unsigned char* data = frame->GrayscaleData(*cam0);
+                if (data)
                 {
-                    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - configSavedTime).count();
-                    if (ms > 2000) showConfigSaved = false;
+                    latestGray0 = cv::Mat(cam0H, cam0W, CV_8UC1,
+                                         const_cast<unsigned char*>(data)).clone();
+                    r0 = processFrame(data, cam0W, cam0H, hom0, settings);
                 }
-
-                OSDState osd;
-                osd.continuousSend    = continuousSend;
-                osd.homographyReady   = hom.ready;
-                osd.selectedPointCount = static_cast<int>(hom.selectedPoints.size());
-                osd.displayCount      = hom.ready
-                                       ? static_cast<int>(r.inBoundCenters.size())
-                                       : static_cast<int>(r.detectedCenters.size());
-                osd.configSaved       = showConfigSaved;
-                renderOSD(combined, osd);
-
-                cv::imshow(windowName, combined);
             }
         }
 
-        // ===== 연속 UDP 전송 (호모그래피 설정 완료 후에만) =====
-        if (continuousSend && hom.ready && !latestSendCenters.empty())
-            sender.send(latestSendCenters);
+        // ── 카메라 1 프레임 처리 ──
+        {
+            auto frame = cam1->LatestFrame();
+            if (frame && frame->IsGrayscale())
+            {
+                const unsigned char* data = frame->GrayscaleData(*cam1);
+                if (data)
+                {
+                    latestGray1 = cv::Mat(cam1H, cam1W, CV_8UC1,
+                                         const_cast<unsigned char*>(data)).clone();
+                    r1 = processFrame(data, cam1W, cam1H, hom1, settings);
+                }
+            }
+        }
 
-        // ===== 키 입력 처리 =====
+        // ── 메인 창 합성 ──
+        cv::Mat mainView(mainH, cam0W + cam1W, CV_8UC3, cv::Scalar(20, 20, 20));
+
+        if (!r0.leftPanel.empty())
+        {
+            // 검출된 블롭 중심 (초록 원) 표시
+            for (const auto& c : r0.detectedCenters)
+                cv::circle(r0.leftPanel, c, 5, cv::Scalar(0, 200, 0), -1);
+            r0.leftPanel.copyTo(mainView(cv::Rect(0, 0, cam0W, cam0H)));
+        }
+        if (!r1.leftPanel.empty())
+        {
+            for (const auto& c : r1.detectedCenters)
+                cv::circle(r1.leftPanel, c, 5, cv::Scalar(0, 200, 0), -1);
+            r1.leftPanel.copyTo(mainView(cv::Rect(cam0W, 0, cam1W, cam1H)));
+        }
+
+        // 카메라 구분 헤더 바
+        cv::rectangle(mainView, cv::Point(0, 0), cv::Point(cam0W, 18),
+                      cv::Scalar(40, 40, 80), cv::FILLED);
+        cv::rectangle(mainView, cv::Point(cam0W, 0), cv::Point(cam0W + cam1W, 18),
+                      cv::Scalar(40, 80, 40), cv::FILLED);
+        cv::putText(mainView, std::string("CAM 0 - ") + cam0->Name(),
+                    cv::Point(6, 14), cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                    cv::Scalar(200, 200, 255), 1, cv::LINE_AA);
+        cv::putText(mainView, std::string("CAM 1 - ") + cam1->Name(),
+                    cv::Point(cam0W + 6, 14), cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                    cv::Scalar(200, 255, 200), 1, cv::LINE_AA);
+
+        // 좌우 구분선
+        cv::line(mainView, cv::Point(cam0W, 0), cv::Point(cam0W, mainH),
+                 cv::Scalar(150, 150, 150), 2);
+
+        // Config 저장 타이머
+        if (showConfigSaved)
+        {
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - configSavedTime).count();
+            if (ms > 2000) showConfigSaved = false;
+        }
+
+        // OSD
+        drawMainOSD(mainView, continuousSend,
+                    (int)hom0.selectedPoints.size(), hom0.ready,
+                    (int)hom1.selectedPoints.size(), hom1.ready,
+                    showConfigSaved, cam0W);
+
+        cv::imshow(mainWin, mainView);
+
+        // ── 워프 이어붙임 창 (두 카메라 모두 준비됐을 때) ──
+        if (hom0.ready && hom1.ready &&
+            !latestGray0.empty() && !latestGray1.empty())
+        {
+            cv::Mat warped0, warped1;
+            cv::warpPerspective(latestGray0, warped0, hom0.matrix,
+                                cv::Size(settings.targetWidth, settings.targetHeight));
+            cv::warpPerspective(latestGray1, warped1, hom1.matrix,
+                                cv::Size(settings.targetWidth, settings.targetHeight));
+
+            cv::Mat wc0, wc1;
+            cv::cvtColor(warped0, wc0, cv::COLOR_GRAY2BGR);
+            cv::cvtColor(warped1, wc1, cv::COLOR_GRAY2BGR);
+
+            // 워프 좌표계 내 블롭 중심 (빨간 점)
+            for (const auto& c : r0.inBoundCenters)
+            {
+                cv::circle(wc0, c, 6, cv::Scalar(0, 0, 255), -1);
+                cv::putText(wc0,
+                            "(" + std::to_string((int)c.x) + "," + std::to_string((int)c.y) + ")",
+                            cv::Point((int)c.x + 8, (int)c.y - 5),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1);
+            }
+            for (const auto& c : r1.inBoundCenters)
+            {
+                cv::circle(wc1, c, 6, cv::Scalar(0, 0, 255), -1);
+                // x 좌표는 cam1 오프셋(targetWidth) 적용하여 표시
+                int dispX = (int)c.x + settings.targetWidth;
+                cv::putText(wc1,
+                            "(" + std::to_string(dispX) + "," + std::to_string((int)c.y) + ")",
+                            cv::Point((int)c.x + 8, (int)c.y - 5),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(0, 255, 0), 1);
+            }
+
+            // 워프 창 헤더 바
+            cv::rectangle(wc0, cv::Point(0,0), cv::Point(wc0.cols, 18),
+                          cv::Scalar(40, 40, 80), cv::FILLED);
+            cv::rectangle(wc1, cv::Point(0,0), cv::Point(wc1.cols, 18),
+                          cv::Scalar(40, 80, 40), cv::FILLED);
+            cv::putText(wc0, std::string("CAM 0 - ") + cam0->Name() + " [Warped]",
+                        cv::Point(6, 14), cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                        cv::Scalar(200, 200, 255), 1, cv::LINE_AA);
+            cv::putText(wc1, std::string("CAM 1 - ") + cam1->Name() + " [Warped]",
+                        cv::Point(6, 14), cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                        cv::Scalar(200, 255, 200), 1, cv::LINE_AA);
+
+            // 이어 붙이기
+            cv::Mat stitched;
+            cv::hconcat(wc0, wc1, stitched);
+
+            // 구분선
+            cv::line(stitched,
+                     cv::Point(settings.targetWidth, 0),
+                     cv::Point(settings.targetWidth, stitched.rows),
+                     cv::Scalar(150, 150, 150), 2);
+
+            if (!stitchedWinOpen)
+            {
+                cv::namedWindow(stitchedWin, cv::WINDOW_AUTOSIZE | cv::WINDOW_GUI_NORMAL);
+                stitchedWinOpen = true;
+                std::cout << "[Warped] Stitched view opened." << std::endl;
+            }
+            cv::imshow(stitchedWin, stitched);
+
+            // UDP 전송
+            // cam0: x in [0, targetWidth-1]
+            // cam1: x in [targetWidth, 2*targetWidth-1]  (오프셋 적용)
+            if (continuousSend)
+            {
+                if (!r0.inBoundCenters.empty())
+                    sender.send(r0.inBoundCenters);
+                if (!r1.inBoundCenters.empty())
+                {
+                    std::vector<cv::Point2f> offsetCenters1;
+                    offsetCenters1.reserve(r1.inBoundCenters.size());
+                    for (const auto& c : r1.inBoundCenters)
+                        offsetCenters1.emplace_back(c.x + settings.targetWidth, c.y);
+                    sender.send(offsetCenters1);
+                }
+            }
+        }
+
+        // ── 키 입력 ──
         int key = cv::waitKey(1);
 
-        if (key == 'q' || key == 'Q' || key == 27)
+        if (key == 113 || key == 81 || key == 27)  // q Q ESC
         {
             running = false;
         }
-        else if (key == 'r' || key == 'R')
+        else if (key == 114 || key == 82)  // r R
         {
-            hom.reset();
-            latestSendCenters.clear();
-            std::cout << "Point selection reset." << std::endl;
+            hom0.reset();
+            hom1.reset();
+            std::cout << "All corners reset." << std::endl;
         }
-        else if (key == 'u' || key == 'U')
+        else if (key == 117 || key == 85)  // u U
         {
             continuousSend = !continuousSend;
-            std::cout << "[UDP] Real-time send: " << (continuousSend ? "ON" : "OFF") << std::endl;
+            std::cout << "[UDP] " << (continuousSend ? "ON" : "OFF") << std::endl;
         }
-        else if (key == 's' || key == 'S')
+        else if (key == 115 || key == 83)  // s S
         {
-            if (saveConfig(settings, hom.selectedPoints))
+            bool ok = saveConfig(settings, hom0.selectedPoints, 0) &&
+                      saveConfig(settings, hom1.selectedPoints, 1);
+            if (ok)
             {
                 showConfigSaved = true;
                 configSavedTime = std::chrono::steady_clock::now();
             }
         }
-        else if (key == 'p' || key == 'P')
+        else if (key == 112 || key == 80)  // p P
         {
             AppSettings prev = settings;
             if (ShowSettingsDialog(settings))
             {
                 if (settings.exposure != prev.exposure)
                 {
-                    camera->SetExposure(settings.exposure);
-                    std::cout << "[Settings] Exposure updated to " << settings.exposure << std::endl;
+                    cam0->SetExposure(settings.exposure);
+                    cam1->SetExposure(settings.exposure);
+                    std::cout << "[Settings] Exposure -> " << settings.exposure << std::endl;
                 }
                 if (strcmp(settings.ipAddress, prev.ipAddress) != 0 ||
                     settings.port != prev.port)
-                {
                     sender.updateTarget(settings.ipAddress, settings.port);
-                }
                 if (settings.targetWidth  != prev.targetWidth ||
                     settings.targetHeight != prev.targetHeight)
                 {
                     mouseData.targetWidth  = settings.targetWidth;
                     mouseData.targetHeight = settings.targetHeight;
-                    hom.reset();
-                    latestSendCenters.clear();
-                    std::cout << "[Settings] Target resolution changed to "
-                              << settings.targetWidth << "x" << settings.targetHeight
-                              << ". Homography reset." << std::endl;
+                    hom0.reset();
+                    hom1.reset();
+                    std::cout << "[Settings] Target res changed -> all corners reset." << std::endl;
                 }
             }
         }
     }
 
-    // ========== 정리 및 종료 ==========
+    // ========== 정리 ==========
     cv::destroyAllWindows();
     WSACleanup();
     CameraManager::X().Shutdown();
-
-    std::cout << "Program terminated successfully." << std::endl;
+    std::cout << "Program terminated." << std::endl;
     restoreLog();
     return 0;
 }
