@@ -18,6 +18,7 @@ struct AppSettings
     int  targetWidth;
     int  targetHeight;
     int  exposure;
+    int  udpFps;        // UDP 전송 속도 제한 (fps), 0 = 제한 없음
 
     AppSettings()
     {
@@ -26,6 +27,7 @@ struct AppSettings
         targetWidth  = 1024;
         targetHeight = 768;
         exposure     = 7500;
+        udpFps       = 60;
     }
 };
 

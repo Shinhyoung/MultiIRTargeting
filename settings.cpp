@@ -9,9 +9,10 @@
 #define IDC_SETT_WIDTH    203
 #define IDC_SETT_HEIGHT   204
 #define IDC_SETT_EXPOSURE 205
+#define IDC_SETT_UDPFPS   206
 
 // 파일 static: 다이얼로그 내부에서만 사용
-static HWND         g_hIp, g_hPort, g_hWidth, g_hHeight, g_hExposure;
+static HWND         g_hIp, g_hPort, g_hWidth, g_hHeight, g_hExposure, g_hUdpFps;
 static AppSettings* g_pDlgSettings = nullptr;
 static int          g_dlgResult    = 0; // 0 = Cancel/닫기, 1 = OK
 
@@ -65,7 +66,11 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
 
         makeLabel("Exposure (0 ~ 7500):", y);
         sprintf_s(buf, "%d", g_pDlgSettings->exposure);
-        g_hExposure = makeEdit(buf, IDC_SETT_EXPOSURE, y, true); y += rowH + 10;
+        g_hExposure = makeEdit(buf, IDC_SETT_EXPOSURE, y, true); y += rowH;
+
+        makeLabel("UDP TX Rate (1 ~ 1000 fps):", y);
+        sprintf_s(buf, "%d", g_pDlgSettings->udpFps);
+        g_hUdpFps = makeEdit(buf, IDC_SETT_UDPFPS, y, true); y += rowH + 10;
 
         // OK / Cancel 버튼
         const int btnW = 80, btnH = 28, btnGap = 12;
@@ -109,6 +114,10 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             int e = atoi(buf);
             g_pDlgSettings->exposure = std::max(0, std::min(7500, e));
 
+            GetWindowTextA(g_hUdpFps, buf, sizeof(buf));
+            int fps = atoi(buf);
+            g_pDlgSettings->udpFps = std::max(1, std::min(1000, fps));
+
             g_dlgResult = 1;
             DestroyWindow(hwnd);
         }
@@ -147,8 +156,8 @@ bool ShowSettingsDialog(AppSettings& settings)
 
     // 클라이언트 영역 크기: margin=12, labelW=170, editW=150, gap=8
     // clientW = 12+170+8+150+12 = 352
-    // clientH = 12 + 5*32 + 10 + 28 + 12 = 222
-    RECT rc = { 0, 0, 352, 222 };
+    // clientH = 12 + 6*32 + 10 + 28 + 12 = 254
+    RECT rc = { 0, 0, 352, 254 };
     DWORD style   = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     DWORD exStyle = WS_EX_DLGMODALFRAME | WS_EX_APPWINDOW;
     AdjustWindowRectEx(&rc, style, FALSE, exStyle);
