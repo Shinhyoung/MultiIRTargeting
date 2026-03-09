@@ -56,11 +56,10 @@ static void drawMainOSD(cv::Mat& img,
                         int slot0, int slot1)
 {
     {
-        cv::Mat overlay = img.clone();
         int boxH = (numCams > 2) ? 172 : 154;
-        cv::rectangle(overlay, cv::Point(4, 4), cv::Point(310, boxH),
-                      cv::Scalar(15, 15, 15), cv::FILLED);
-        cv::addWeighted(overlay, 0.65, img, 0.35, 0, img);
+        cv::Mat roi = img(cv::Rect(4, 4, 306, boxH - 4));
+        roi *= 0.35;
+        roi += cv::Scalar(15 * 0.65, 15 * 0.65, 15 * 0.65);
     }
 
     cv::Scalar udpColor  = udpOn ? cv::Scalar(60,255,60) : cv::Scalar(120,200,255);
@@ -342,6 +341,7 @@ int main(int argc, char* argv[])
             int s1 = atomSlot1.load();
 
             // ── 전체 카메라 캡처 + 처리 ──
+            bool anyFrame = false;
             for (int i = 0; i < numCams; i++)
             {
                 auto frame = allCams[i]->LatestFrame();
@@ -352,10 +352,17 @@ int main(int argc, char* argv[])
                 cv::Mat gray(camH[i], camW[i], CV_8UC1, const_cast<unsigned char*>(data));
                 FrameResult res = processFrame(data, camW[i], camH[i], localHom[i], settings);
 
-                std::lock_guard<std::mutex> lk(frameMutex);
-                latestGray[i] = gray.clone();
-                results[i]    = std::move(res);
+                {
+                    std::lock_guard<std::mutex> lk(frameMutex);
+                    latestGray[i] = gray.clone();
+                    results[i]    = std::move(res);
+                }
+                anyFrame = true;
             }
+
+            // 프레임이 없으면 CPU 과점유 방지를 위해 짧은 sleep
+            if (!anyFrame)
+                std::this_thread::sleep_for(std::chrono::microseconds(500));
 
             // ── UDP 전송 (fps 제한 적용) ──
             int  targetFps      = atomUdpFps.load(std::memory_order_relaxed);
